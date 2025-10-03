@@ -5,7 +5,7 @@
 # Written by Ze Liu
 # --------------------------------------------------------
 # Vision Transformer with Deformable Attention
-# Modified by Zhuofan Xia 
+# Modified by Zhuofan Xia
 # --------------------------------------------------------
 
 import os
@@ -13,6 +13,7 @@ import time
 import argparse
 import datetime
 import numpy as np
+import yaml
 
 import torch
 import torch.nn as nn
@@ -27,35 +28,58 @@ from data import build_loader
 from lr_scheduler import build_scheduler
 from optimizer import build_optimizer
 from logger import create_logger
-from utils import load_checkpoint, load_pretrained, save_checkpoint, \
-                   get_grad_norm, auto_resume_helper, reduce_tensor
+from utils import load_checkpoint, load_pretrained, save_checkpoint, get_grad_norm, auto_resume_helper, reduce_tensor
 
 from torch.cuda.amp import GradScaler, autocast
 
+import wandb
+
 import warnings
-warnings.filterwarnings('ignore')
+
+warnings.filterwarnings("ignore")
 
 
 def parse_option():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--cfg', type=str, required=True, metavar="FILE", help='path to config file', )
+    parser.add_argument(
+        "--cfg",
+        type=str,
+        required=True,
+        metavar="FILE",
+        help="path to config file",
+    )
     parser.add_argument(
         "--opts",
         help="Modify config options by adding 'KEY VALUE' pairs. ",
         default=None,
-        nargs='+',
+        nargs="+",
     )
     # easy config modification
-    parser.add_argument('--batch-size', type=int, help="batch size for single GPU")
-    parser.add_argument('--data-path', type=str, help='path to dataset')
-    parser.add_argument('--resume', help='resume from checkpoint')
-    parser.add_argument('--amp', action='store_true', default=False)
-    parser.add_argument('--output', default='output', type=str, metavar='PATH',
-                        help='root of output folder, the full path is <output>/<model_name>/<tag> (default: output)')
-    parser.add_argument('--tag', help='tag of experiment')
-    parser.add_argument('--eval', action='store_true', help='Perform evaluation only')
-    parser.add_argument('--throughput', action='store_true', help='Test throughput only')
-    parser.add_argument('--print-freq', type=int, help='Printing frequency.', default=100)
+    parser.add_argument("--batch-size", type=int, help="batch size for single GPU")
+    parser.add_argument("--data-path", type=str, help="path to dataset")
+    parser.add_argument("--resume", help="resume from checkpoint")
+    parser.add_argument("--amp", action="store_true", default=False)
+    parser.add_argument(
+        "--output",
+        default="output",
+        type=str,
+        metavar="PATH",
+        help="root of output folder, the full path is <output>/<model_name>/<tag> (default: output)",
+    )
+    parser.add_argument("--tag", help="tag of experiment")
+    parser.add_argument("--eval", action="store_true", help="Perform evaluation only")
+    parser.add_argument("--throughput", action="store_true", help="Test throughput only")
+    parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging")
+    parser.add_argument("--wandb-project", type=str, default="dat++", help="Weights & Biases project name")
+    parser.add_argument("--wandb-entity", type=str, help="Weights & Biases entity")
+    parser.add_argument("--wandb-run-name", type=str, help="Weights & Biases run name")
+    parser.add_argument("--wandb-tags", type=str, nargs="*", help="Weights & Biases tags")
+    parser.add_argument("--wandb-mode", type=str, choices=["online", "offline", "disabled"], help="Weights & Biases mode")
+    parser.add_argument("--wandb-resume", type=str, help="Weights & Biases resume id")
+    parser.add_argument("--wandb-id", type=str, help="Weights & Biases run id")
+    parser.add_argument("--wandb-notes", type=str, help="Weights & Biases notes")
+    parser.add_argument("--print-freq", type=int, help="Printing frequency.", default=100)
+    parser.add_argument("--freeze-backbone", action="store_true", help="Freeze all layers except the classification head")
 
     args, unparsed = parser.parse_known_args()
 
@@ -64,13 +88,60 @@ def parse_option():
     return args, config
 
 
+def setup_wandb(config, logger, config_file_path=None):
+    if not config.WANDB.ENABLED:
+        return None
+
+    if dist.get_rank() != 0:
+        os.environ.setdefault("WANDB_MODE", "disabled")
+        return None
+
+    init_kwargs = {
+        "project": config.WANDB.PROJECT or config.MODEL.NAME,
+        "entity": config.WANDB.ENTITY or None,
+        "name": config.WANDB.RUN_NAME or None,
+        "tags": config.WANDB.TAGS or None,
+        "mode": config.WANDB.MODE or "online",
+        "notes": config.WANDB.NOTES or None,
+    }
+
+    if config.WANDB.RESUME:
+        init_kwargs["resume"] = config.WANDB.RESUME
+    if config.WANDB.ID:
+        init_kwargs["id"] = config.WANDB.ID
+        init_kwargs.setdefault("resume", "allow")
+
+    init_kwargs = {k: v for k, v in init_kwargs.items() if v not in (None, "", [])}
+
+    try:
+        run = wandb.init(**init_kwargs)
+    except Exception as err:
+        logger.error(f"wandb の初期化に失敗しました: {err}")
+        return None
+
+    try:
+        cfg_dict = yaml.safe_load(config.dump())
+        run.config.update(cfg_dict, allow_val_change=True)
+        run.config.update({"output_dir": config.OUTPUT}, allow_val_change=True)
+    except Exception as err:
+        logger.warning(f"wandb への設定同期に失敗しました: {err}")
+
+    if config_file_path and os.path.isfile(config_file_path):
+        try:
+            run.save(config_file_path, base_path=os.path.dirname(config_file_path))
+        except Exception as err:
+            logger.warning(f"wandb への設定ファイル添付に失敗しました: {err}")
+
+    logger.info("wandb ログを初期化しました")
+    return run
+
+
 def main():
-    
     args, config = parse_option()
     local_rank = int(os.environ["LOCAL_RANK"])
     rank = int(os.environ["RANK"])
-    world_size = int(os.environ['WORLD_SIZE'])
-    dist.init_process_group(backend='nccl', init_method='env://', world_size=world_size, rank=rank) 
+    world_size = int(os.environ["WORLD_SIZE"])
+    dist.init_process_group(backend="nccl", init_method="env://", world_size=world_size, rank=rank)
     torch.cuda.set_device(local_rank)
     dist.barrier()
 
@@ -80,12 +151,12 @@ def main():
     cudnn.enabled = True
     cudnn.benchmark = True
 
-    if config.DATA.DATASET == 'imagenet':
+    if config.DATA.DATASET == "imagenet":
         standard_bs = 512.0
-    elif config.DATA.DATASET == 'imagenet22k':
+    elif config.DATA.DATASET == "imagenet22k":
         standard_bs = 4096.0
     else:
-        raise RuntimeError("Wrong dataset!")
+        standard_bs = getattr(config.TRAIN, "REFERENCE_BATCH", 512.0)
 
     # linear scale the learning rate according to total batch size, may not be optimal
     linear_scaled_lr = config.TRAIN.BASE_LR * config.DATA.BATCH_SIZE * dist.get_world_size() / standard_bs
@@ -101,91 +172,163 @@ def main():
     os.makedirs(config.OUTPUT, exist_ok=True)
     logger = create_logger(output_dir=config.OUTPUT, dist_rank=dist.get_rank(), name=f"{config.MODEL.NAME}")
 
+    config_file_path = None
     if dist.get_rank() == 0:
         path = os.path.join(config.OUTPUT, "config.yaml")
         with open(path, "w") as f:
             f.write(config.dump())
         logger.info(f"Full config saved to {path}")
+        config_file_path = path
 
     # print config
     logger.info(config.dump())
-    
+
     _, dataset_val, data_loader_train, data_loader_val, mixup_fn = build_loader(config)
+    train_steps_per_epoch = len(data_loader_train)
+
+    wandb_run = setup_wandb(config, logger, config_file_path=config_file_path)
+    if wandb_run is not None and dist.get_rank() == 0:
+        try:
+            wandb_run.config.update(
+                {
+                    "data/train_steps_per_epoch": train_steps_per_epoch,
+                    "data/val_batches": len(data_loader_val),
+                    "data/val_samples": len(dataset_val),
+                },
+                allow_val_change=True,
+            )
+        except Exception as err:
+            logger.warning(f"wandb へのデータ情報同期に失敗しました: {err}")
 
     logger.info(f"Creating model:{config.MODEL.TYPE}/{config.MODEL.NAME}")
     model = build_model(config)
     model.cuda()
+    if config.TRAIN.FREEZE_BACKBONE:
+        for name, param in model.named_parameters():
+            if not name.startswith("cls_head"):
+                param.requires_grad = False
     model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
     logger.info(str(model))
 
     optimizer = build_optimizer(config, model)
 
     model = nn.parallel.DistributedDataParallel(
-        model, device_ids=[local_rank], broadcast_buffers=True,
-        find_unused_parameters=False)
+        model, device_ids=[local_rank], broadcast_buffers=True, find_unused_parameters=False
+    )
     model_without_ddp = model.module
-    
+
     lr_scheduler = build_scheduler(config, optimizer, len(data_loader_train))
 
-    if config.AUG.MIXUP > 0.:
+    if config.AUG.MIXUP > 0.0:
         # smoothing is handled with mixup label transform
         criterion = SoftTargetCrossEntropy()
-    elif config.MODEL.LABEL_SMOOTHING > 0.:
+    elif config.MODEL.LABEL_SMOOTHING > 0.0:
         criterion = LabelSmoothingCrossEntropy(smoothing=config.MODEL.LABEL_SMOOTHING)
     else:
         criterion = nn.CrossEntropyLoss()
 
     max_accuracy = 0.0
-    
-    if config.MODEL.PRETRAINED is not None:
-        pretrained_ckpt_path = config.MODEL.PRETRAINED
-        load_pretrained(pretrained_ckpt_path, model_without_ddp, logger)
 
-    if config.TRAIN.AUTO_RESUME and config.MODEL.RESUME == '':
-        resume_file = auto_resume_helper(config.OUTPUT)
-        if resume_file:
-            if config.MODEL.RESUME:
-                logger.warning(f"auto-resume changing resume file from {config.MODEL.RESUME} to {resume_file}")
-            config.defrost()
-            config.MODEL.RESUME = resume_file
-            config.freeze()
-            logger.info(f'auto resuming from {resume_file}')
-        else:
-            logger.info(f'no checkpoint found in {config.OUTPUT}, ignoring auto resume')
+    try:
+        if config.MODEL.PRETRAINED is not None:
+            pretrained_ckpt_path = config.MODEL.PRETRAINED
+            load_pretrained(pretrained_ckpt_path, model_without_ddp, logger)
 
-    if config.MODEL.RESUME:
-        max_accuracy = load_checkpoint(config, model_without_ddp, optimizer, lr_scheduler, logger)
-        acc1, acc5, loss = validate(config, data_loader_val, model, logger)
-        torch.cuda.empty_cache()
-        logger.info(f"Accuracy of the network on the {len(dataset_val)} test images: {acc1:.1f}%")
-        if config.EVAL_MODE:
+        if config.TRAIN.AUTO_RESUME and config.MODEL.RESUME == "":
+            resume_file = auto_resume_helper(config.OUTPUT)
+            if resume_file:
+                if config.MODEL.RESUME:
+                    logger.warning(f"auto-resume changing resume file from {config.MODEL.RESUME} to {resume_file}")
+                config.defrost()
+                config.MODEL.RESUME = resume_file
+                config.freeze()
+                logger.info(f"auto resuming from {resume_file}")
+            else:
+                logger.info(f"no checkpoint found in {config.OUTPUT}, ignoring auto resume")
+
+        if config.MODEL.RESUME:
+            max_accuracy = load_checkpoint(config, model_without_ddp, optimizer, lr_scheduler, logger)
+            acc1, acc5, loss = validate(
+                config,
+                data_loader_val,
+                model,
+                logger,
+                wandb_run=wandb_run,
+                epoch=config.TRAIN.START_EPOCH,
+                global_step=config.TRAIN.START_EPOCH * train_steps_per_epoch,
+            )
+            torch.cuda.empty_cache()
+            logger.info(f"Accuracy of the network on the {len(dataset_val)} test images: {acc1:.1f}%")
+            max_accuracy = max(max_accuracy, acc1)
+            if wandb_run is not None and dist.get_rank() == 0:
+                wandb_run.summary["best_acc1"] = max_accuracy
+            if config.EVAL_MODE:
+                return
+
+        if config.THROUGHPUT_MODE:
+            throughput(data_loader_val, model, logger)
             return
+        logger.info("Start training")
+        start_time = time.time()
+        for epoch in range(config.TRAIN.START_EPOCH, config.TRAIN.EPOCHS):
+            data_loader_train.sampler.set_epoch(epoch)
 
-    if config.THROUGHPUT_MODE:
-        throughput(data_loader_val, model, logger)
-        return
-    logger.info("Start training")
-    start_time = time.time()
-    for epoch in range(config.TRAIN.START_EPOCH, config.TRAIN.EPOCHS):
-        data_loader_train.sampler.set_epoch(epoch)
+            train_one_epoch(
+                config,
+                model,
+                criterion,
+                data_loader_train,
+                optimizer,
+                epoch,
+                mixup_fn,
+                lr_scheduler,
+                logger,
+                wandb_run=wandb_run,
+                steps_per_epoch=train_steps_per_epoch,
+            )
 
-        train_one_epoch(config, model, criterion, data_loader_train, optimizer, epoch, mixup_fn, lr_scheduler, logger)
+            if dist.get_rank() == 0 and ((epoch + 1) % config.SAVE_FREQ == 0 or (epoch + 1) == (config.TRAIN.EPOCHS)):
+                save_checkpoint(config, epoch + 1, model_without_ddp, max_accuracy, optimizer, lr_scheduler, logger)
 
-        if dist.get_rank() == 0 and ((epoch + 1) % config.SAVE_FREQ == 0 or (epoch + 1) == (config.TRAIN.EPOCHS)):
-            save_checkpoint(config, epoch + 1, model_without_ddp, max_accuracy, optimizer, lr_scheduler, logger)
+            acc1, acc5, loss = validate(
+                config,
+                data_loader_val,
+                model,
+                logger,
+                wandb_run=wandb_run,
+                epoch=epoch + 1,
+                global_step=(epoch + 1) * train_steps_per_epoch,
+            )
 
-        acc1, acc5, loss = validate(config, data_loader_val, model, logger)
+            logger.info(f"Accuracy of the network on the {len(dataset_val)} test images: {acc1:.1f}%")
+            max_accuracy = max(max_accuracy, acc1)
+            logger.info(f"Max accuracy: {max_accuracy:.2f}%")
+            if wandb_run is not None and dist.get_rank() == 0:
+                wandb_run.summary["best_acc1"] = max_accuracy
 
-        logger.info(f"Accuracy of the network on the {len(dataset_val)} test images: {acc1:.1f}%")
-        max_accuracy = max(max_accuracy, acc1)
-        logger.info(f'Max accuracy: {max_accuracy:.2f}%')
+        total_time = time.time() - start_time
+        total_time_str = str(datetime.timedelta(seconds=int(total_time)))
+        logger.info("Training time {}".format(total_time_str))
+        if wandb_run is not None and dist.get_rank() == 0:
+            wandb_run.summary["training_time"] = total_time
+    finally:
+        if wandb_run is not None and dist.get_rank() == 0:
+            wandb_run.finish()
 
-    total_time = time.time() - start_time
-    total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-    logger.info('Training time {}'.format(total_time_str))
 
-
-def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mixup_fn, lr_scheduler, logger):
+def train_one_epoch(
+    config,
+    model,
+    criterion,
+    data_loader,
+    optimizer,
+    epoch,
+    mixup_fn,
+    lr_scheduler,
+    logger,
+    wandb_run=None,
+    steps_per_epoch=None,
+):
     model.train()
     optimizer.zero_grad()
 
@@ -198,17 +341,17 @@ def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mix
     end = time.time()
 
     scaler = GradScaler()
-    
+
+    is_main_process = dist.get_rank() == 0
     for idx, (samples, targets) in enumerate(data_loader):
-        
         optimizer.zero_grad()
         samples = samples.cuda(non_blocking=True)
         targets = targets.cuda(non_blocking=True)
 
         if mixup_fn is not None:
             samples, targets = mixup_fn(samples, targets)
-        
-        if config.AMP: 
+
+        if config.AMP:
             with autocast():
                 outputs, _, _ = model(samples)
                 loss = criterion(outputs, targets)
@@ -235,28 +378,46 @@ def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mix
         lr_scheduler.step_update(epoch * num_steps + idx)
 
         torch.cuda.synchronize()
-        
+
         loss_meter.update(loss.item(), targets.size(0))
         norm_meter.update(grad_norm)
         batch_time.update(time.time() - end)
         end = time.time()
 
         if (idx + 1) % config.PRINT_FREQ == 0:
-            lr = optimizer.param_groups[0]['lr']
+            lr = optimizer.param_groups[0]["lr"]
             memory_used = torch.cuda.max_memory_allocated() / (1024.0 * 1024.0)
             etas = batch_time.avg * (num_steps - idx)
             logger.info(
-                f'Train: [{epoch + 1}/{config.TRAIN.EPOCHS}][{idx + 1}/{num_steps}]\t'
-                f'eta {datetime.timedelta(seconds=int(etas))} lr {lr:.6f}\t'
-                f'time {batch_time.val:.4f} ({batch_time.avg:.4f})\t'
-                f'loss {loss_meter.val:.4f} ({loss_meter.avg:.4f})\t'
-                f'grad_norm {norm_meter.val:.4f} ({norm_meter.avg:.4f})\t'
-                f'mem {memory_used:.0f}MB')
+                f"Train: [{epoch + 1}/{config.TRAIN.EPOCHS}][{idx + 1}/{num_steps}]\t"
+                f"eta {datetime.timedelta(seconds=int(etas))} lr {lr:.6f}\t"
+                f"time {batch_time.val:.4f} ({batch_time.avg:.4f})\t"
+                f"loss {loss_meter.val:.4f} ({loss_meter.avg:.4f})\t"
+                f"grad_norm {norm_meter.val:.4f} ({norm_meter.avg:.4f})\t"
+                f"mem {memory_used:.0f}MB"
+            )
+            if wandb_run is not None and is_main_process:
+                global_step = epoch * num_steps + idx + 1
+                log_payload = {
+                    "train/loss": loss_meter.val,
+                    "train/loss_avg": loss_meter.avg,
+                    "train/grad_norm": norm_meter.val,
+                    "train/lr": lr,
+                    "train/batch_time": batch_time.val,
+                    "train/batch_time_avg": batch_time.avg,
+                    "train/memory_mb": memory_used,
+                    "epoch": epoch + 1,
+                }
+                wandb_run.log(log_payload, step=global_step)
     epoch_time = time.time() - start
     logger.info(f"EPOCH {epoch + 1} training takes {datetime.timedelta(seconds=int(epoch_time))}")
+    if wandb_run is not None and is_main_process:
+        last_step = (epoch + 1) * num_steps if steps_per_epoch is None else (epoch + 1) * steps_per_epoch
+        wandb_run.log({"train/epoch_time": epoch_time, "epoch": epoch + 1}, step=last_step)
+
 
 @torch.no_grad()
-def validate(config, data_loader, model, logger):
+def validate(config, data_loader, model, logger, wandb_run=None, epoch=None, global_step=None):
     criterion = nn.CrossEntropyLoss()
     model.eval()
 
@@ -292,14 +453,25 @@ def validate(config, data_loader, model, logger):
         if (idx + 1) % config.PRINT_FREQ == 0:
             memory_used = torch.cuda.max_memory_allocated() / (1024.0 * 1024.0)
             logger.info(
-                f'Test: [{(idx + 1)}/{len(data_loader)}]\t'
-                f'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
-                f'Loss {loss_meter.val:.4f} ({loss_meter.avg:.4f})\t'
-                f'Acc@1 {acc1_meter.val:.3f} ({acc1_meter.avg:.3f})\t'
-                f'Acc@5 {acc5_meter.val:.3f} ({acc5_meter.avg:.3f})\t'
-                f'Mem {memory_used:.0f}MB')
-    logger.info(f' * Acc@1 {acc1_meter.avg:.3f} Acc@5 {acc5_meter.avg:.3f}')
+                f"Test: [{(idx + 1)}/{len(data_loader)}]\t"
+                f"Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t"
+                f"Loss {loss_meter.val:.4f} ({loss_meter.avg:.4f})\t"
+                f"Acc@1 {acc1_meter.val:.3f} ({acc1_meter.avg:.3f})\t"
+                f"Acc@5 {acc5_meter.val:.3f} ({acc5_meter.avg:.3f})\t"
+                f"Mem {memory_used:.0f}MB"
+            )
+    logger.info(f" * Acc@1 {acc1_meter.avg:.3f} Acc@5 {acc5_meter.avg:.3f}")
+    if wandb_run is not None and dist.get_rank() == 0:
+        log_payload = {
+            "val/loss": loss_meter.avg,
+            "val/acc1": acc1_meter.avg,
+            "val/acc5": acc5_meter.avg,
+        }
+        if epoch is not None:
+            log_payload["epoch"] = epoch
+        wandb_run.log(log_payload, step=global_step)
     return acc1_meter.avg, acc5_meter.avg, loss_meter.avg
+
 
 @torch.no_grad()
 def throughput(data_loader, model, logger):
@@ -320,5 +492,6 @@ def throughput(data_loader, model, logger):
         logger.info(f"batch_size {batch_size} throughput {30 * batch_size / (tic2 - tic1)}")
         return
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()
