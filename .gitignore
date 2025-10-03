@@ -118,3 +118,9 @@ ddetr_b3.yaml
 # misc
 stat_mem.py
 stat_model.py
+
+datasets
+ckpt/
+.serena/
+wandb/
+dev_diary/
