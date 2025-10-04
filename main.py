@@ -80,6 +80,7 @@ def parse_option():
     parser.add_argument("--wandb-notes", type=str, help="Weights & Biases notes")
     parser.add_argument("--print-freq", type=int, help="Printing frequency.", default=100)
     parser.add_argument("--freeze-backbone", action="store_true", help="Freeze all layers except the classification head")
+    parser.add_argument("--save-top-k", type=int, help="Keep top-K checkpoints in addition to the latest one")
 
     args, unparsed = parser.parse_known_args()
 
@@ -287,9 +288,6 @@ def main():
                 steps_per_epoch=train_steps_per_epoch,
             )
 
-            if dist.get_rank() == 0 and ((epoch + 1) % config.SAVE_FREQ == 0 or (epoch + 1) == (config.TRAIN.EPOCHS)):
-                save_checkpoint(config, epoch + 1, model_without_ddp, max_accuracy, optimizer, lr_scheduler, logger)
-
             acc1, acc5, loss = validate(
                 config,
                 data_loader_val,
@@ -303,6 +301,17 @@ def main():
             logger.info(f"Accuracy of the network on the {len(dataset_val)} test images: {acc1:.1f}%")
             max_accuracy = max(max_accuracy, acc1)
             logger.info(f"Max accuracy: {max_accuracy:.2f}%")
+            if dist.get_rank() == 0 and (((epoch + 1) % config.SAVE_FREQ == 0) or (epoch + 1) == (config.TRAIN.EPOCHS)):
+                save_checkpoint(
+                    config,
+                    epoch + 1,
+                    model_without_ddp,
+                    max_accuracy,
+                    optimizer,
+                    lr_scheduler,
+                    logger,
+                    accuracy=acc1,
+                )
             if wandb_run is not None and dist.get_rank() == 0:
                 wandb_run.summary["best_acc1"] = max_accuracy
 
@@ -483,7 +492,7 @@ def throughput(data_loader, model, logger):
         for i in range(50):
             model(images)
         torch.cuda.synchronize()
-        logger.info(f"throughput averaged with 30 times")
+        logger.info("throughput averaged with 30 times")
         tic1 = time.time()
         for i in range(30):
             model(images)

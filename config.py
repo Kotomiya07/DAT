@@ -166,6 +166,8 @@ _C.OUTPUT = ""
 _C.TAG = "default"
 # Frequency to save checkpoint
 _C.SAVE_FREQ = 1
+# Number of top-performing checkpoints to keep alongside the latest checkpoint
+_C.SAVE_TOP_K = 3
 # Frequency to logging info
 _C.PRINT_FREQ = 100
 # Fixed random seed
@@ -180,7 +182,7 @@ _C.LOCAL_RANK = 0
 
 def _update_config_from_file(config, cfg_file):
     config.defrost()
-    with open(cfg_file, "r") as f:
+    with open(cfg_file, "r", encoding="utf-8") as f:
         yaml_cfg = yaml.load(f, Loader=yaml.FullLoader)
 
     for cfg in yaml_cfg.setdefault("BASE", [""]):
@@ -211,6 +213,8 @@ def update_config(config, args):
         config.TRAIN.FREEZE_BACKBONE = args.freeze_backbone
     if args.print_freq:
         config.PRINT_FREQ = args.print_freq
+    if getattr(args, "save_top_k", None) is not None:
+        config.SAVE_TOP_K = max(0, args.save_top_k)
     if args.output:
         config.OUTPUT = args.output
     if args.tag:
