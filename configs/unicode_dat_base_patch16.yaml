@@ -1,0 +1,60 @@
+MODEL:
+  TYPE: dat
+  NAME: dat_unicode_base
+  DAT:
+    img_size: 128
+    patch_size: 16
+    num_classes: 2703
+    expansion: 4
+    dim_stem: 128
+    dims: [128, 256, 512, 1024]
+    depths: [2, 4, 18, 2]
+    stage_spec: [['N', 'D'], ['N', 'D', 'N', 'D'], ['N', 'D', 'N', 'D', 'N', 'D', 'N', 'D', 'N', 'D', 'N', 'D', 'N', 'D', 'N', 'D', 'N', 'D'], ['D', 'D']]
+    heads: [4, 8, 16, 32]
+    window_sizes: [5, 5, 5, 5]
+    groups: [1, 2, 4, 8]
+    use_pes: [True, True, True, True]
+    dwc_pes: [False, False, False, False]
+    strides: [2, 1, 1, 1]
+    offset_range_factor: [-1, -1, -1, -1]
+    no_offs: [False, False, False, False]
+    fixed_pes: [False, False, False, False]
+    use_dwc_mlps: [True, True, True, True]
+    use_lpus: [True, True, True, True]
+    use_conv_patches: False
+    ksizes: [7, 5, 3, 3]
+    nat_ksizes: [5, 5, 3, 3]
+    drop_rate: 0.0
+    attn_drop_rate: 0.0
+    drop_path_rate: 0.5
+
+DATA:
+  DATASET: unicode_characters
+  DATA_PATH: datasets/raw/dataset
+  SPLIT_FILE: datasets/metadata/character_splits.json
+  LABEL_MAP: datasets/metadata/unicode_label_mapping.json
+  NUM_CLASSES: 2703
+  IMG_SIZE: 128
+  BATCH_SIZE: 256
+  NUM_WORKERS: 8
+  PIN_MEMORY: True
+
+TRAIN:
+  EPOCHS: 120
+  WARMUP_EPOCHS: 5
+  BASE_LR: 1.0e-4
+  MIN_LR: 5.0e-6
+  AUTO_RESUME: True
+
+AUG:
+  MIXUP: 0.2
+  CUTMIX: 0.0
+  AUTO_AUGMENT: none
+  REPROB: 0.1
+
+TEST:
+  CROP: False
+
+AMP: True
+PRINT_FREQ: 50
+
