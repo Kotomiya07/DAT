@@ -1,6 +1,6 @@
 MODEL:
   TYPE: dat
-  NAME: dat_unicode_base
+  NAME: dat_unicode_base_patch16
   DAT:
     img_size: 128
     patch_size: 16
@@ -9,24 +9,24 @@ MODEL:
     dim_stem: 128
     dims: [128, 256, 512, 1024]
     depths: [2, 4, 18, 2]
-    stage_spec: [['N', 'D'], ['N', 'D', 'N', 'D'], ['N', 'D', 'N', 'D', 'N', 'D', 'N', 'D', 'N', 'D', 'N', 'D', 'N', 'D', 'N', 'D', 'N', 'D'], ['D', 'D']]
+    stage_spec: [[N, D], [N, D, N, D], [N, D, N, D, N, D, N, D, N, D, N, D, N, D, N, D, N, D], [D, D]]
     heads: [4, 8, 16, 32]
-    window_sizes: [5, 5, 5, 5]
-    groups: [1, 2, 4, 8]
+    window_sizes: [7, 7, 7, 7]
+    groups: [2, 4, 8, 16]
     use_pes: [True, True, True, True]
     dwc_pes: [False, False, False, False]
-    strides: [2, 1, 1, 1]
+    strides: [8, 4, 2, 1]
     offset_range_factor: [-1, -1, -1, -1]
     no_offs: [False, False, False, False]
     fixed_pes: [False, False, False, False]
     use_dwc_mlps: [True, True, True, True]
     use_lpus: [True, True, True, True]
     use_conv_patches: False
-    ksizes: [7, 5, 3, 3]
-    nat_ksizes: [5, 5, 3, 3]
+    ksizes: [9, 7, 5, 3]
+    nat_ksizes: [7, 7, 7, 7]
     drop_rate: 0.0
     attn_drop_rate: 0.0
-    drop_path_rate: 0.5
+    drop_path_rate: 0.7
 
 DATA:
   DATASET: unicode_characters

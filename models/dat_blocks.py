@@ -224,8 +224,14 @@ class DAttentionBaseline(nn.Module):
             indexing='ij'
         )
         ref = torch.stack((ref_y, ref_x), -1)
-        ref[..., 1].div_(W_key - 1.0).mul_(2.0).sub_(1.0)
-        ref[..., 0].div_(H_key - 1.0).mul_(2.0).sub_(1.0)
+        if W_key > 1:
+            ref[..., 1].div_(W_key - 1.0).mul_(2.0).sub_(1.0)
+        else:
+            ref[..., 1].fill_(0.0)
+        if H_key > 1:
+            ref[..., 0].div_(H_key - 1.0).mul_(2.0).sub_(1.0)
+        else:
+            ref[..., 0].fill_(0.0)
         ref = ref[None, ...].expand(B * self.n_groups, -1, -1, -1) # B * g H W 2
 
         return ref
@@ -239,8 +245,14 @@ class DAttentionBaseline(nn.Module):
             indexing='ij'
         )
         ref = torch.stack((ref_y, ref_x), -1)
-        ref[..., 1].div_(W - 1.0).mul_(2.0).sub_(1.0)
-        ref[..., 0].div_(H - 1.0).mul_(2.0).sub_(1.0)
+        if W > 1:
+            ref[..., 1].div_(W - 1.0).mul_(2.0).sub_(1.0)
+        else:
+            ref[..., 1].fill_(0.0)
+        if H > 1:
+            ref[..., 0].div_(H - 1.0).mul_(2.0).sub_(1.0)
+        else:
+            ref[..., 0].fill_(0.0)
         ref = ref[None, ...].expand(B * self.n_groups, -1, -1, -1) # B * g H W 2
 
         return ref
@@ -257,8 +269,10 @@ class DAttentionBaseline(nn.Module):
         n_sample = Hk * Wk
 
         if self.offset_range_factor >= 0 and not self.no_off:
-            offset_range = torch.tensor([1.0 / (Hk - 1.0), 1.0 / (Wk - 1.0)], device=device).reshape(1, 2, 1, 1)
-            offset = offset.tanh().mul(offset_range).mul(self.offset_range_factor)
+            offset_scale = torch.ones(2, device=device, dtype=offset.dtype)
+            offset_scale[0] = 1.0 / (Hk - 1.0) if Hk > 1 else 0.0
+            offset_scale[1] = 1.0 / (Wk - 1.0) if Wk > 1 else 0.0
+            offset = offset.tanh().mul(offset_scale.view(1, 2, 1, 1)).mul(self.offset_range_factor)
 
         offset = einops.rearrange(offset, 'b p h w -> b h w p')
         reference = self._get_ref_points(Hk, Wk, B, dtype, device)
